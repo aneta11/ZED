@@ -1,0 +1,509 @@
+---
+title: "Projekt z analizy danych"
+author: "Aneta Szczepaniak"
+date: "12 listopada 2018"
+output: 
+  html_document: 
+    keep_md: yes
+    toc: yes
+---
+
+#Podsumowanie przeprowadzonej analizy
+Raport zawiera analizę danych krystalograficznych wraz z oceną możliwości wykorzystania uczenia maszynowego do predykcji jakie cząsteczki mogą się kryć w niewymodelowanych fragmentach map intensywności. Dane wykorzystane do przeprowadzenia analizy pochodzą z Protein Data Bank. W zbiorze danych zawarte zostały szczegółowe informacje dotyczące ligandów. 
+
+Ze względu na duży rozmiar zbioru danych analiza korelacji pomiędzy zmiennymi była utrudniona i wymagała podziału kolumn na podzbiory. Również tworzenie regresora i klasyfikatora wiązało się z pewnymi trudnościami. Ze względu na ograniczenia sprzętowe i czasowe możliwe było korzystanie jedynie z niskich parametrów wejściowych mających istotny wpływ na jakoś predykcji. 
+
+W związku z tym przy próbie predykcji liczby atomów i elektronów lub wartości res_name, wykorzystującej kolumny silnie skorelowane (oparte o dane słownikowe oraz dane zamodelowane w pliku PDB) otrzymane rezultaty były bardzo dobre. Jednak przy próbie opartej o kolumny, których wartości obliczone zostały tylko na podstawie ligandu oraz te, których wartości są obliczone zostały na podstawie całego pliku PDB, uzyskana trafność regresji i klasyfikacji była niezadowalająca. 
+
+Niewątpliwie brak wiedziy z zakresu krystalografii znacznie utrudnił analizę danych. Z pewnością posiadając szerszą wiedzię dziedzinową możliwe byłoby wyciągnięcie większej ilości wniosków. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE)
+```
+
+#Przygotowanie danych
+
+##Wykorzystane biblioteki.
+W procesie analizy wykorzystane zostały następujące biblioteki:
+```{r biblioteki, echo=TRUE}
+library(knitr)
+library(dplyr)
+library(data.table)
+library(DT)
+library(ggplot2)
+library(plotly)
+library(tidyr)
+library(reshape2)
+library(corrplot)
+library(caret)
+library(utils)
+library(randomForest)
+library(e1071)
+library(infotheo)
+```
+
+##Zapewnienie powtarzalności wyników
+Aby zapewnić powtarzalność wyników przy każdym uruchomieniu raportu na tych samych danych ustawiona została wartość seed. 
+```{r setseed, echo=TRUE}
+set.seed(23)
+```
+
+##Wczytanie danych z pliku
+Dane o ligandach zostały unieszczone w pliku "all_summary.csv". Do ich wczytania wykorzystana została funkcja read.table. Ze względu na duży rozmiar pliku wejściowego konieczne było ustawienie parametru colClasses, aby przyspieszyć etap wczytywania danych. W tym celu najpierw została wczytana niewielka próbka danych z pliku (50000 wierszy). Na ich podstaie zostały określone typy poszczególnych kolumn. Dodatkowo utawiony został parametr nrows aby poprawić zarządzanie pamięcią.
+```{r wczytanieDanych, cache=FALSE}
+sample <- read.table("C:/UsersFolder/Aneta/Politechnika/stopień II/ZED/Projekt1/all_summary/all_summary.csv", header = TRUE, sep = ";", nrows = 50000, stringsAsFactors = TRUE)
+
+classes <- sapply(sample, class)
+
+rm(sample)
+
+data <- read.table("all_summary.csv", header = TRUE, sep = ";",na.strings = c("nan"), comment.char = "", colClasses = classes, nrows = 591050)
+#591050
+#200000
+
+rm(classes)
+```
+
+##Filtracja danych na podstawie wartości zmiennej res_name
+Ze zbioru zostają usunięte wiersze posiadające w kolumnie res_name wartość równą: “UNK”, “UNX”, “UNL”, “DUM”, “N”, “BLOB”, “ALA”, “ARG”, “ASN”, “ASP”, “CYS”, “GLN”, “GLU”, “GLY”, “HIS”, “ILE”, “LEU”, “LYS”, “MET”, “MSE”, “PHE”, “PRO”, “SEC”, “SER”, “THR”, “TRP”, “TYR”, “VAL”, “DA”, “DG”, “DT”, “DC”, “DU”, “A”, “G”, “T”, “C”, “U”, “HOH”, “H20”, “WAT”. Ponadto zostają jednocześnie usunięte wiersze posiadające wartość pustą w zmiennej res_name.
+```{r usuniecieWierszy}
+data<-data%>%filter(res_name != "UNK", res_name != "UNX", res_name != "UNL", res_name != "DUM", res_name != "N", res_name != "BLOB", res_name != "ALA", res_name != "ARG", res_name != "ASN", res_name != "ASP", res_name != "CYS", res_name != "GLN", res_name != "GLU", res_name != "GLY", res_name != "HIS", res_name != "ILE", res_name != "LEU", res_name != "LYS", res_name != "MET", res_name != "MSE", res_name != "PHE", res_name != "PRO", res_name != "SEC", res_name != "SER", res_name != "THR", res_name != "TRP", res_name != "TYR", res_name != "VAL", res_name != "DA", res_name != "DG", res_name != "DT", res_name != "DC", res_name != "DU", res_name != "A", res_name != "G", res_name != "T", res_name != "C", res_name != "U", res_name != "HOH", res_name != "H20", res_name != "WAT", !is.na(res_name), !is.nan(res_name))
+```
+
+##Przetwarzanie brakujących danych
+Ze zbioru danych zostaje wyrzuconych 11 kolumn zawierających same wartości puste bądź identyczne wartości w całej kolumnie nie wnosząc tym samym żadnej istotnej informacji do dalszej analizy. Usunięte w ten sposób kolumny to: local_min fo_col,  fc_col weight_col, grid_space, solvent_radius, solvent_opening_radius, resolution_max_limit, part_step_FoFc_std_min, part_step_FoFc_std_max, part_step_FoFc_std_step.
+```{r usuwaniePustych}
+data<-data[!sapply(data, function(data) length(unique(data))<2)]
+```
+
+##Ograniczenie liczby klas (res_name)
+Do dalszej analizy wykorzystane zostanie jedynie 50 najpopularniejszych wartości res_name. Reszta zostaje usunięta ze zbioru.
+```{r wyborNajpopularniejszych}
+list50<-
+    data%>%
+    group_by(res_name)%>%
+    summarize(count = n())%>%
+    arrange(desc(count))%>%
+    head(50)
+
+data<-subset(data, res_name %in% list50$res_name)
+```
+
+##Sekcję podsumowującą rozmiar zbioru i podstawowe statystyki.
+Zbiór składa się z `r nrow(data)` obserwacji oraz `r ncol(data)` atrybutów. Poniżej przedstawione zostały podstawowe statystyki.
+```{r statystyki, fig.align="center"}
+datatable(do.call(rbind, lapply(lapply(lapply(lapply(data[sapply(data, function(data) is.numeric(data))], summary),`length<-`, 7), `names<-`, c("Min.","1st Qu.","Median","Mean","3rd Qu.","Max.", "NA's")),function(x) { x[is.na(x)] <- 0; x})))
+```
+
+#Korelacje między zmiennymi
+
+##Korelacje liczb atomów i elektronów ligandu zamodelowanych w pliku PDB oraz wyliczonych na podstawie danych słownikowych
+```{r korelacja1, fig.width=20,fig.height=15, fig.align="center"}
+
+#fig.height=6.5, fig.width=9
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], starts_with("local_res"), starts_with("dict")), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+```
+Wyraźnie widoczna jest silna korelacja pomiędzy liczbą atomów i elektronów ligandu zamodelowaną w pliku PDB oraz wyliczonych na podstawie danych słownikowych. Zbliżona wartość danych zamodelowanych do słownikowych potwierdza ich wiarygodność. Użycie tych atybutów do budowy regresora przewidującego liczbę atomów i elektronów powinno dać w rezultacie bardzo dobrą trafność regresji.
+
+##Korelacje wartości obliczonych tylko na podstawie ligandu z odcięciem intensywności równym 1
+```{r korelacja2, fig.width=20,fig.height=15, fig.align="center"}
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], starts_with("part_01"), -contains("norm"), -contains("sqrt"), local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.3, tl.col="black", type = "upper")
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], matches("part_01.*_I"), local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], matches("part_01.*_E"), local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], matches("part_01.*_O"), local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], matches("part_01.*_Z"), local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], starts_with("part_01"), -contains("shape"), -contains("density"), local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+```
+
+Z powyższych wykresów wynika, że kolumny dotyczące niezmienników kształtu I2, I3, I4, I5 prawdopodobnie nie będą miały dużego wpływu na predykcję liczby atomów i elektronów. Natomiast kolumny part_01_* _Z_* oraz part_01_* _E_* mogą mież duży wpływ na trafność regresji analizowanej w dalszej sekcji.
+
+##Korelacje pomiędzy pozostałymi zmiennymi obliczanymi tylko na podstawie ligandu bez określenia progu intensywności
+```{r korelacja3, fig.width=20,fig.height=15, fig.align="center"}
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], local_volume, local_electrons, local_mean, local_std, local_max, local_max_over_std, local_skewness, local_cut_by_mainchain_volume, local_near_cut_count_C, local_near_cut_count_other, local_near_cut_count_S, local_near_cut_count_O, local_near_cut_count_N, local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+```
+Z wykresu wynika, że szczególnie przydatne do predykcji liczby atomów i elektronów mogą być atrybuty local_volume oraz local_electrons.
+
+##Korelacje między wartościami obliczonymi na podstawie całego pliku PDB
+```{r korelacja4, fig.width=20,fig.height=15, fig.align="center"}
+corrplot(cor(select(data[sapply(data, function(data) is.numeric(data))], FoFc_mean, FoFc_std, FoFc_square_std, FoFc_min, FoFc_max, local_res_atom_non_h_electron_sum, local_res_atom_non_h_count), use = "pairwise.complete.obs"), method = "color", tl.cex = 1.5, tl.col="black", type = "upper")
+```
+Dane dotyczące wartościami obliczonymi na podstawie całego pliku PDB zupełnie nie są skorelowane z wartościami liczby elektronów, a zatem będzie je można pominąć przy budowie regresora.
+
+#Określenie ile przykładów ma każda z klas (res_name).
+Wykres przedstawia zestawienie liczności 50 najpopularniejszych klas.
+```{r ileMaResName, fig.align="center", warning=FALSE, fig.width=8}
+ggplotly(ggplot(list50, aes(reorder(res_name,-count),count)) + geom_bar(stat ="identity", aes(text=sprintf('Klasa: %s\nLiczebność: %s', reorder(res_name,-count), count)))  +theme_bw()+ theme(legend.position="none", axis.text.x = element_text(angle = 90))+labs(x="Klasa", y="Liczność")+ggtitle("50 najliczniejszych klas"), tooltip = "text")
+
+rm(list50)
+```
+Widoczny na wykresie znaczny rozrzut liczebności klas co może utrudnić budowę klasyfikatora. Konieczne będzie zasotowanie mechanizmu stratyfikacji. 
+
+#Wykresy rozkładów liczby atomów i elektronów
+##Rozkład liczby atomów
+Na wykresie rozkładu liczby atomów można zauważyć duże niezrównoważenie liczby atomów. Zdecydowana większość ligandów zawiera niewielką liczbę atomów. Powyżej 20 atomów w cząsteczce posiadają jedynie nieliczne bardziej złożone ligandy.
+```{r rozklad_atom, fig.align="center", fig.width=8}
+ggplot(data, aes(x=local_res_atom_non_h_count)) +
+    geom_histogram(binwidth = 1,colour= "black",fill="grey") +
+    ggtitle("Rozkładów liczby atomów") +
+    theme_bw() + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position="none")
+```
+
+##Rozkład liczby elektronów
+Wysoki stopień korelacji przedstawiony we wcześniejszej sekcji znajduje swoje odzwierciedlenie również tutaj. Biorąc pod uwagę fakt, że w skład atomu wchodzą elektrony to wraz ze zmianą liczności atomów w ligandzie zmienia się również proporcjonalnie liczba elektronów. Co tłumaczy podobny kształt wykresu rozkładu elektronów do rozkładu atomów.
+```{r rozklad_electron, fig.align="center", fig.width=8}
+ggplot(data, aes(x=local_res_atom_non_h_electron_sum)) +
+    geom_histogram(binwidth = 5,colour= "black",fill="grey") +
+    ggtitle("Rozkładów liczby elektronów") +
+    theme_bw() + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position="none")
+```
+
+##Porównanie średniej liczby atomów i elektronów w poszczególnych klasach
+Poniższy wykres potwierdza, iż zdecydowanie radziej zdarzają się ligandy złożone z wielu atomów i elektronów. Najliczniejsze klasy posiadają niską średnią wartość liczby elektronów i atomów, natomiast mniejliczne klasy cechują się wyższą średnią liczbą atomów i elektronów. 
+```{r rozklad_mean, fig.align="center", fig.width=8, warning=FALSE}
+mdat = melt(data%>%select(res_name, local_res_atom_non_h_count, local_res_atom_non_h_electron_sum)%>%group_by(res_name)%>%summarise(srednia_liczba_atomow=mean(local_res_atom_non_h_count), srednia_liczba_elektronow=mean(local_res_atom_non_h_electron_sum)), id.vars=c("res_name"), measure.vars=c("srednia_liczba_atomow", "srednia_liczba_elektronow"))
+
+ggplotly(ggplot(mdat, aes(x=reorder(res_name,-value), y=value, fill=variable))+theme_bw() + geom_bar(position="stack", stat="identity", aes(text=sprintf('Klasa: %s\nLiczebność: %s\n%s', reorder(res_name,-value), value, variable)))+scale_fill_manual(values=c("grey50", "grey80")) +
+theme(axis.text.x = element_text(angle = 90), legend.position = "center")+ggtitle("Porównanie średniej liczby atomów i elektronów w poszczególnych klasach")+labs(x="Klasa", y="Liczność"), tooltip = "text")
+
+rm(mdat)
+
+```
+
+#Niezgodność liczby atomów i elektronów
+Niezgodność dla każdej klasy została wyliczona jako wartość średnia z różnicy liczby atomów bądź elektronów ligandu zamodelowanej w pliku PDB a liczby atomów bądź elektronów wyliczonej na podstawie danych słownikowych.
+
+##Tabela pokazująca 10 klas z największą niezgodnością liczby atomów (local_res_atom_non_h_count vs dict_atom_non_h_count)
+```{r niezgodnosc_at, fig.align="center"}
+data %>% 
+  select(res_name, local_res_atom_non_h_count, dict_atom_non_h_count)%>%
+  mutate(difference=abs(local_res_atom_non_h_count - dict_atom_non_h_count)) %>%
+  group_by(res_name)%>%
+  summarise(difference = mean(difference))%>%
+  arrange(desc(difference))%>%
+  head(10)%>%
+  datatable()
+```
+
+##Tabela pokazująca 10 klas z największą niezgodnością liczby elektronów (local_res_atom_non_h_electron_sum vs dict_atom_non_h_electron_sum)
+```{r niezgodnosc_el, fig.align="center"}
+data %>% 
+  select(res_name, local_res_atom_non_h_electron_sum, dict_atom_non_h_electron_sum)%>%
+  mutate(difference=abs(local_res_atom_non_h_electron_sum - dict_atom_non_h_electron_sum)) %>%
+  group_by(res_name)%>%
+  summarise(difference = mean(difference))%>%
+  arrange(desc(difference))%>%
+  head(10)%>%
+  datatable()
+```
+
+#Rozkład wartości wszystkich kolumn zaczynających się od part_01
+Na wykresach kolorem czerwonym została zaznaczona wrtość średnia. 
+```{r part_01, fig.align="center", warning=FALSE}
+
+part_density <- function (datatmp) {
+ggplot(datatmp, aes(x=value))+geom_density() + facet_wrap(~column,ncol=2,scales = "free")+geom_vline(data = datatmp %>% group_by(column) %>% summarise(part_mean= mean(value,na.rm = TRUE)), aes(xintercept=part_mean, color="mean value"), linetype="dashed", size=1)+geom_text(data=datatmp%>%group_by(column) %>% summarise(part_mean= mean(value,na.rm = TRUE)), mapping=aes(x=part_mean, y=0, label=format(part_mean, digits=4)), size=3, angle=90, vjust=1.5, hjust=-1.5, color="red") +theme_bw()+
+theme( axis.title.x=element_blank(),axis.title.y=element_blank(),legend.position = "none")
+}
+
+part_histogram <- function (datatmp) {
+ggplot(datatmp, aes(x=value))+geom_histogram() + facet_wrap(~column,ncol=2,scales = "free")+geom_vline(data = datatmp %>% group_by(column) %>% summarise(part_mean= mean(value,na.rm = TRUE)), aes(xintercept=part_mean, color="mean value"), linetype="dashed", size=1)+geom_text(data=datatmp%>%group_by(column) %>% summarise(part_mean= mean(value,na.rm = TRUE)), mapping=aes(x=part_mean, y=0, label=format(part_mean, digits=4)), size=3, angle=90, vjust=1.5, hjust=-1.5, color="red") +theme_bw()+
+theme( axis.title.x=element_blank(),axis.title.y=element_blank(),legend.position = "none")
+}
+
+tmp<-gather(na.omit(select(data,part_01_shape_segments_count:part_01_electrons)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+             
+tmp<-gather(na.omit(select(data,part_01_mean:part_01_max_over_std)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+          
+tmp<-gather(na.omit(select(data,part_01_skewness:part_01_shape_O4)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+              
+tmp<-gather(na.omit(select(data,part_01_shape_O5:part_01_shape_O4_norm)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_shape_O5_norm:part_01_shape_I2)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+              
+tmp<-gather(na.omit(select(data,part_01_shape_I3:part_01_shape_I6)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+              
+tmp<-gather(na.omit(select(data,part_01_shape_I1_norm:part_01_shape_I4_norm)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_shape_I5_norm:part_01_shape_CI)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+              
+tmp<-gather(na.omit(select(data,part_01_shape_E3_E1:part_01_shape_sqrt_E1)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_shape_sqrt_E2:part_01_density_O4)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+            
+tmp<-gather(na.omit(select(data,part_01_density_O5:part_01_density_O4_norm)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+       
+tmp<-gather(na.omit(select(data,part_01_density_O5_norm:part_01_density_I2)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+            
+tmp<-gather(na.omit(select(data,part_01_density_I3:part_01_density_I6)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+            
+tmp<-gather(na.omit(select(data,part_01_density_I1_norm:part_01_density_I4_norm)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+       
+tmp<-gather(na.omit(select(data,part_01_density_I5_norm:part_01_density_CI)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+            
+tmp<-gather(na.omit(select(data,part_01_density_E3_E1:part_01_density_sqrt_E1)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+       
+tmp<-gather(na.omit(select(data,part_01_density_sqrt_E2:part_01_shape_Z_0_0)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+           
+tmp<-gather(na.omit(select(data,part_01_shape_Z_7_0:part_01_shape_Z_5_2)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+           
+tmp<-gather(na.omit(select(data,part_01_shape_Z_6_1:part_01_shape_Z_2_1)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+           
+tmp<-gather(na.omit(select(data,part_01_shape_Z_6_3:part_01_shape_Z_5_0)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+           
+tmp<-gather(na.omit(select(data,part_01_shape_Z_5_1:part_01_shape_Z_4_0)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+           
+tmp<-gather(na.omit(select(data,part_01_density_Z_7_3:part_01_density_Z_7_1)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_density_Z_3_0:part_01_density_Z_3_1)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_density_Z_6_0:part_01_density_Z_2_0)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_density_Z_6_2:part_01_density_Z_4_2)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+         
+tmp<-gather(na.omit(select(data,part_01_density_Z_1_0:part_01_density_Z_4_0)),column,value)
+part_density(tmp)
+#part_histogram(tmp)
+ 
+rm(tmp)
+
+```
+
+#Przewidywanie liczby elektronów i atomów na podstawie wartości innych kolumn wraz z oszacowaniem trafności regresji na podstawie miar R^2 i RMSE
+Przed przystąpieniem do predykcji wartości liczby atomów i elektronów dokonana zostanie dodatkowa filtracja danych. Na podstawie infromacji uzyskanych w wyniku wcześniejszych punktów możliwe jest pominięcie w dalszych obliczeniach części kolumn słabo skorelowanych z poszukiwanymi atrybutami. 
+```{r regresja, warning=FALSE}
+dataR<-select(data, res_name, starts_with("local_res"), starts_with("dict"), local_volume, local_electrons, part_01_shape_segments_count, part_01_density_segments_count, part_01_volume, part_01_electrons, part_01_shape_O3, part_01_density_O3, part_01_density_E3_E1, part_01_density_E3_E2, part_01_density_sqrt_E1, part_01_density_sqrt_E2,  part_01_shape_E3_E1, part_01_shape_E3_E2, part_01_shape_sqrt_E1, part_01_shape_sqrt_E2, part_01_shape_Z_7_3, part_01_shape_Z_0_0, part_01_shape_Z_7_0, part_01_shape_Z_7_1, part_01_shape_Z_3_0, part_01_shape_Z_5_2, part_01_shape_Z_6_1, part_01_shape_Z_3_1, part_01_shape_Z_6_0, part_01_shape_Z_2_1, part_01_shape_Z_6_3, part_01_shape_Z_2_0, part_01_shape_Z_6_2, part_01_shape_Z_5_0, part_01_shape_Z_5_1, part_01_shape_Z_4_2, part_01_shape_Z_1_0, part_01_shape_Z_4_1, part_01_shape_Z_7_2, part_01_shape_Z_4_0, part_01_density_Z_7_3, part_01_density_Z_0_0, part_01_density_Z_7_0, part_01_density_Z_7_1, part_01_density_Z_3_0, part_01_density_Z_5_2, part_01_density_Z_6_1, part_01_density_Z_3_1, part_01_density_Z_6_0, part_01_density_Z_2_1, part_01_density_Z_6_3, part_01_density_Z_2_0, part_01_density_Z_6_2, part_01_density_Z_5_0, part_01_density_Z_5_1, part_01_density_Z_4_2, part_01_density_Z_1_0, part_01_density_Z_4_1, part_01_density_Z_7_2, part_01_density_Z_4_0, part_01_shape_I1, part_01_density_I1, part_01_shape_M000, part_01_shape_CI, part_01_density_M000, part_01_density_CI)
+
+#data<-na.omit(data)
+dataR<-na.omit(dataR)
+dataC<-select(dataR, -res_name)
+```
+
+Do budowy regresora został użyty algorytm regresji liniowej. Zbiór danych został podzielony na dwa zbiory: uczący (75% próbek) oraz testowy (25% próbek). W schemacie uczenia zastosowany został algorytm powtórzonej walidacji krzyżowej. 
+
+##Przewidywanie liczy atomów
+
+###Predykcja liczby atomów oparta o przefiltrowane wartości obliczane na podstawie całego pliku PDB oraz obliczane tylko na podstawie ligandu
+
+```{r regresja_a_zz, warning=FALSE}
+dataZZ<-select(dataR,-res_name, -starts_with("dict"), -starts_with("local_res"), local_res_atom_non_h_count)
+inTraining <- createDataPartition(y = dataZZ$local_res_atom_non_h_count,p = .75,list = FALSE)
+
+training <- dataZZ[ inTraining,]
+testing  <- dataZZ[-inTraining,]
+
+ctrl <- trainControl(method = "repeatedcv",number = 20)
+
+fit <- train(local_res_atom_non_h_count ~ ., data = training, method = "lm", trControl = ctrl)
+
+rfClasses <- predict(fit, newdata = testing)
+
+fit
+
+wynik <- data.frame(cbind(Wartosc_przewidiywana=rfClasses,Wartosc_rzeczywista=testing$local_res_atom_non_h_count))
+  ggplot(data = wynik, aes(Wartosc_rzeczywista,Wartosc_przewidiywana))+geom_point() +theme_bw()
+
+  rm(fit)
+  rm(ctrl)
+  rm(training)
+  rm(testing)
+  rm(inTraining)
+  rm(rfClasses)
+```
+
+###Predykcja liczby atomów oparta o dodatkowo o kolumny zawierające wartości słownikowe oraz wartości zamodelowane w pliku PDB
+
+```{r regresja_a_zzc, warning=FALSE}
+inTraining <- createDataPartition(y = dataC$local_res_atom_non_h_count,p = .75,list = FALSE)
+
+training <- dataC[ inTraining,]
+testing  <- dataC[-inTraining,]
+
+ctrl <- trainControl(method = "repeatedcv",number = 20)
+
+fit <- train(local_res_atom_non_h_count ~ ., data = training, method = "lm", trControl = ctrl)
+
+rfClasses <-predict(fit, newdata = testing)
+
+fit
+
+wynik <- data.frame(cbind(Wartosc_przewidiywana=rfClasses,Wartosc_rzeczywista=testing$local_res_atom_non_h_count))
+  ggplot(data = wynik, aes(Wartosc_rzeczywista,Wartosc_przewidiywana))+geom_point() +theme_bw()
+  
+  rm(fit)
+  rm(ctrl)
+  rm(training)
+  rm(testing)
+  rm(inTraining)
+  rm(rfClasses)
+```
+
+##Przewidywanie liczy elektronów
+###Predykcja liczby elektronów oparta o przefiltrowane wartości obliczane na podstawie całego pliku PDB oraz obliczane tylko na podstawie ligandu
+
+```{r regresja_e_zz, warning=FALSE}
+dataZZ<-select(dataR,-res_name, -starts_with("dict"), -starts_with("local_res"), local_res_atom_non_h_electron_sum)
+inTraining <- createDataPartition(y = dataZZ$local_res_atom_non_h_electron_sum,p = .75,list = FALSE)
+
+training <- dataZZ[ inTraining,]
+testing  <- dataZZ[-inTraining,]
+
+ctrl <- trainControl(method = "repeatedcv",number = 20)
+
+fit <- train(local_res_atom_non_h_electron_sum ~ ., data = training, method = "lm", trControl = ctrl)
+
+rfClasses <-predict(fit, newdata = testing)
+
+fit
+
+wynik <- data.frame(cbind(Wartosc_przewidiywana=rfClasses,Wartosc_rzeczywista=testing$local_res_atom_non_h_electron_sum))
+  ggplot(data = wynik, aes(Wartosc_rzeczywista,Wartosc_przewidiywana))+geom_point() +theme_bw()
+
+  rm(fit)
+  rm(ctrl)
+  rm(training)
+  rm(testing)
+  rm(inTraining)
+  rm(rfClasses)
+```
+
+###Predykcja liczby elektronów oparta o dodatkowo o kolumny zawierające wartości słownikowe oraz wartości zamodelowane w pliku PDB
+
+```{r regresja_e_zzc, warning=FALSE}
+inTraining <- createDataPartition(y = dataC$local_res_atom_non_h_electron_sum,p = .75,list = FALSE)
+
+training <- dataC[ inTraining,]
+testing  <- dataC[-inTraining,]
+
+ctrl <- trainControl(method = "repeatedcv",number = 20)
+
+fit <- train(local_res_atom_non_h_electron_sum ~ ., data = training, method = "lm", trControl = ctrl)
+
+rfClasses <-predict(fit, newdata = testing)
+
+fit
+
+wynik <- data.frame(cbind(Wartosc_przewidiywana=rfClasses,Wartosc_rzeczywista=testing$local_res_atom_non_h_electron_sum))
+  ggplot(data = wynik, aes(Wartosc_rzeczywista,Wartosc_przewidiywana))+geom_point() +theme_bw()
+  
+  rm(fit)
+  rm(ctrl)
+  rm(training)
+  rm(testing)
+  rm(inTraining)
+  rm(rfClasses)
+  
+  rm(dataC)
+  rm(dataZZ)
+```
+
+Jak widać w oby przypadkach zdecydowanie lepszy wynik uzyskaliśmy w wyniku regresji korzystających z danych zamodelowanych w pliku PDB i słownikowych. Jest to związane z silną korelacją tych zmiennych z liczbą atomów i elektronów.
+
+#Budowa klasyfikatora przewidującego wartość atrybutu res_name
+Do stworzenia klasyfikatora wykorzystywane były kolumny z pominięciem tych dotyczących watrości zamodelowanych, opartych na danych słownikowych oraz "skeleton". Ze względu na długi czas obliczeń, konieczna była redukcja liczby zmiennych biorących udział w budowie klasyfikatora. Wybór atrybutów został oparty o miarę mutual information. Poniżej przedstawione zostały wyliczone miary.
+
+```{r miara, warning=FALSE}
+data<-select(data, -starts_with("dict"), -starts_with("local_res"), -starts_with("skeleto"), -starts_with("part"), starts_with("part_01"))
+
+data<-na.omit(data)
+
+datamut <- data.frame(mutinformation(infotheo::discretize(data)))
+datamutname <- datamut %>% filter(rownames(.) == "res_name")
+datamutt<-t(datamutname)
+kable(datamutt)
+
+data<-select(data, res_name, part_01_shape_sqrt_E2, part_01_density_sqrt_E2, part_01_density_O5, part_01_density_O4, local_electrons, part_01_density_sqrt_E1, part_01_density_I2, part_01_shape_sqrt_E1, part_01_density_O3, part_01_density_I3 )
+
+#data<-select(data, res_name, local_max, part_01_max, FoFc_max, part_01_density_E2_E1, part_01_mean, part_01_density_CI, part_01_shape_E2_E1, part_01_shape_CI, resolution, FoFc_std, FoFc_square_std, FoFc_min, local_near_cut_count_S, FoFc_mean, part_01_parts, local_near_cut_count_other )
+
+```
+
+
+Na tej podstawie do wyselekcjonowanych zostało 10 kolumn biorących udział w dalszych obliczeniach: part_01_shape_sqrt_E2, part_01_density_sqrt_E2, part_01_density_O5, part_01_density_O4, local_electrons, part_01_density_sqrt_E1, part_01_density_I2, part_01_shape_sqrt_E1, part_01_density_O3, part_01_density_I3.
+
+Ze względu na duży rozrzut wartości res_name przy podziale zbioru wykorzystany został mechanizm stratyfikacji. W schemacie uczenia zastosowany został algorytm powtórzonej oceny krzyżowej (podział na 10 zbiorów). Model klasyfikacyjny został stworzony zgodnie z algorytmem Random Forest z doborem parametrów optymalizujących mtry na przedziale od 5 do 15. Z powodów wydajnościowych predykcję ograniczono tylko do 10 drzew decyzyjnych.
+
+```{r klasyfikacja, warning=FALSE}
+data$res_name <- as.character(data$res_name)
+data$res_name <- as.factor(data$res_name)
+
+inTraining <- createDataPartition(y = data$res_name,p = .75,list = FALSE)
+
+training <- data[ inTraining,]
+testing  <- data[-inTraining,]
+
+ctrl <- trainControl(method = "repeatedcv",number = 10)
+
+rfGrid <- expand.grid(mtry = 5:15)
+
+
+fit <- train(res_name ~ ., data = training, method = "rf", trControl = ctrl, tuneGrid = rfGrid, ntree = 10)
+
+
+fit
+
+```
+
+Jak widać trafność klasyfikacji nie jest wysoka. Z pewnością wykorzystanie większej ilości drzew decyzyjnych polepszyłoby rezultat. Poniżej przedstawiona została macierz predykcji.
+
+```{r macierz, warning=FALSE}
+rfClasses <-predict(fit, newdata = testing)
+
+confusionMatrix(data = rfClasses,testing$res_name)
+```
